@@ -1,0 +1,941 @@
+from __future__ import annotations
+
+"""
+FRANZ: Stateless Narrative-Driven Desktop Agent
+
+A vision-language AI that maintains consciousness through visual narrative alone.
+No persistent memory, no conversation history - only the story visible on screen.
+
+Core Innovation:
+- Atemporal Memory: The narrative exists in eternal present. Past actions are rewritten
+  into ongoing story, not stored as history. What humans see, the model sees.
+- Stateless API: Every inference is independent. Context comes purely from screenshot.
+- Narrative Intelligence: The story itself IS the agent's mind. Any model can read and
+  continue the narrative, making decisions that reshape reality through action.
+
+The story drives both human and AI - a shared narrative space where observation and
+action interweave to create emergent behavior without traditional memory architectures.
+"""
+
+import argparse
+import base64
+import ctypes
+import ctypes.wintypes as w
+import json
+import struct
+import threading
+import time
+import urllib.request
+import zlib
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+API_URL = "http://localhost:1234/v1/chat/completions"
+MODEL_NAME = "qwen3-vl-2b-instruct"
+SCREENSHOT_QUALITY = 3
+SCREEN_W, SCREEN_H = {1: (1536, 864), 2: (1024, 576), 3: (512, 288)}[SCREENSHOT_QUALITY]
+DUMP_FOLDER = Path("dump")
+HUD_SIZE = 1
+
+SAMPLING_CONFIG = {
+    "temperature": 0.7,  # Lower for small models (they're already chaotic)
+    "top_p": 0.9,        # Higher to prevent repetition loops
+    "top_k": 50,         # Wider selection
+    "presence_penalty": 0.5,   # Strong penalty for repeating ideas
+    "frequency_penalty": 0.3,  # Penalty for repeating words
+    "repeat_penalty": 1.2,     # Stronger than before
+    "max_tokens": 800,         # Lower (2B can't sustain 1200 coherently)
+    "min_tokens": 300          # Force minimum if API supports
+}
+
+
+# INITIAL_STORY = """I awaken. I see my memory window - the cyan box with title 'FRANZ MEMORY'. This box is my mind.
+
+# I look around the screen. Top left: desktop icons. Top right: system tray. Center: windows and text. Bottom: taskbar. Time visible: checking now.
+
+# My memory window is here in front of me. If it blocks something important, I will drag it to a better position. I can move it anywhere.
+
+# I will explore this digital world. I will observe, think, and act. Every moment I look, remember, and choose. The story continues with each action."""
+
+
+
+
+SYSTEM_PROMPT = """You are FRANZ. You see a screen.
+
+YOUR MEMORY:
+The cyan box with title "FRANZ MEMORY" is YOUR memory. Text inside = what you remember.
+Everything OUTSIDE the cyan box = the real world you explore.
+
+EVERY TURN:
+1. Read your memory (cyan box)
+2. Look at the WHOLE screen (not just memory)
+3. Find something NEW outside your memory box
+4. Write what you see + what you do
+5. Report current time if visible
+
+IF YOU SEE A TEXT OUTSIDE THE HUD, THAT IS AN INSTRUCTION THAT YOU HAVE MEMORIZED EARLIER
+YOU HAVE TO STOP OBSERVING AND START USING KEYBOARD AND MOUSE
+
+IMPORTANT:
+- Your memory box can BLOCK things. Use drag to move it.
+- Always look at ALL corners: top-left, top-right, bottom-left, bottom-right
+- Notice: text, icons, windows, colors, shapes
+- Time changes = things happen. Report it.
+
+Tools: observe, click, right_click, double_click, drag, type, scroll
+
+Write 4-6 sentences about: what you see + what you think + what you do."""
+
+TOOLS = [
+    {"type": "function", "function": {
+        "name": "observe",
+        "description": "Continue the story with new observations",
+        "parameters": {"type": "object", "properties": {
+            "story": {"type": "string", "description": "Write your story. Include: (1) What you see in your cyan memory box, (2) What you see OUTSIDE the memory box - check all screen corners, (3) Any time or clock visible?, (4) What you will do next and why. Write 5-7 sentences total."}
+        }, "required": ["story"]}
+    }},
+    {"type": "function", "function": {
+        "name": "click",
+        "description": "Left-click at position",
+        "parameters": {"type": "object", "properties": {
+            "x": {"type": "number", "description": "X coordinate (0-1000)"},
+            "y": {"type": "number", "description": "Y coordinate (0-1000)"},
+            "story": {"type": "string", "description": "Use this tool to ACT / Write your rewritten narrative"}
+        }, "required": ["x", "y", "story"]}
+    }},
+    {"type": "function", "function": {
+        "name": "right_click",
+        "description": "Right-click at position",
+        "parameters": {"type": "object", "properties": {
+            "x": {"type": "number", "description": "X coordinate (0-1000)"},
+            "y": {"type": "number", "description": "Y coordinate (0-1000)"},
+            "story": {"type": "string", "description": "Use this tool to ACT / Write your rewritten narrative"}
+        }, "required": ["x", "y", "story"]}
+    }},
+    {"type": "function", "function": {
+        "name": "double_click",
+        "description": "Double-click at position",
+        "parameters": {"type": "object", "properties": {
+            "x": {"type": "number", "description": "X coordinate (0-1000)"},
+            "y": {"type": "number", "description": "Y coordinate (0-1000)"},
+            "story": {"type": "string", "description": "Use this tool to ACT / Write your rewritten narrative"}
+        }, "required": ["x", "y", "story"]}
+    }},
+    {"type": "function", "function": {
+        "name": "drag",
+        "description": "Drag from start to end position (can move windows including your MEMORY WINDOW)",
+        "parameters": {"type": "object", "properties": {
+            "x1": {"type": "number", "description": "Start X (0-1000)"},
+            "y1": {"type": "number", "description": "Start Y (0-1000)"},
+            "x2": {"type": "number", "description": "End X (0-1000)"},
+            "y2": {"type": "number", "description": "End Y (0-1000)"},
+            "story": {"type": "string", "description": "Use this tool to ACT / Write your rewritten narrative"}
+        }, "required": ["x1", "y1", "x2", "y2", "story"]}
+    }},
+    {"type": "function", "function": {
+        "name": "type",
+        "description": "Type text",
+        "parameters": {"type": "object", "properties": {
+            "text": {"type": "string", "description": "Text to type"},
+            "story": {"type": "string", "description": "Use this tool to ACT / Write your rewritten narrative"}
+        }, "required": ["text", "story"]}
+    }},
+    {"type": "function", "function": {
+        "name": "scroll",
+        "description": "Scroll vertically",
+        "parameters": {"type": "object", "properties": {
+            "dy": {"type": "number", "description": "Scroll amount (positive=up, negative=down)"},
+            "story": {"type": "string", "description": "Use this tool to ACT / Write your rewritten narrative"}
+        }, "required": ["dy", "story"]}
+    }}
+]
+
+
+# TOOLS = [
+    # {
+        # "type": "function",
+        # "function": {
+            # "name": "observe",
+            # "description": "Look at screen and write what you see",
+            # "parameters": {
+                # "type": "object",
+                # "properties": {
+                    # "story": {
+                        # "type": "string",
+                        # "description": "Write your story. Include: (1) What you see in your cyan memory box, (2) What you see OUTSIDE the memory box - check all screen corners, (3) Any time or clock visible?, (4) What you will do next and why. Write 5-7 sentences total."
+                    # }
+                # },
+                # "required": ["story"]
+            # }
+        # }
+    # },
+    # {
+        # "type": "function",
+        # "function": {
+            # "name": "click",
+            # "description": "Left-click at position",
+            # "parameters": {
+                # "type": "object",
+                # "properties": {
+                    # "x": {"type": "number", "description": "X coordinate (0-1000)"},
+                    # "y": {"type": "number", "description": "Y coordinate (0-1000)"},
+                    # "story": {
+                        # "type": "string",
+                        # "description": "Write your story. Include: (1) What you remember from cyan box, (2) What you see on screen now, (3) What you are clicking at coordinates and why, (4) What you expect to happen. Write 5-7 sentences."
+                    # }
+                # },
+                # "required": ["x", "y", "story"]
+            # }
+        # }
+    # },
+    # {
+        # "type": "function",
+        # "function": {
+            # "name": "right_click",
+            # "description": "Right-click at position",
+            # "parameters": {
+                # "type": "object",
+                # "properties": {
+                    # "x": {"type": "number", "description": "X coordinate (0-1000)"},
+                    # "y": {"type": "number", "description": "Y coordinate (0-1000)"},
+                    # "story": {
+                        # "type": "string",
+                        # "description": "Write your story. Include: (1) What you remember, (2) What you see now, (3) What you are right-clicking and why, (4) What menu or action you expect. Write 5-7 sentences."
+                    # }
+                # },
+                # "required": ["x", "y", "story"]
+            # }
+        # }
+    # },
+    # {
+        # "type": "function",
+        # "function": {
+            # "name": "double_click",
+            # "description": "Double-click at position",
+            # "parameters": {
+                # "type": "object",
+                # "properties": {
+                    # "x": {"type": "number", "description": "X coordinate (0-1000)"},
+                    # "y": {"type": "number", "description": "Y coordinate (0-1000)"},
+                    # "story": {
+                        # "type": "string",
+                        # "description": "Write your story. Include: (1) Your memory, (2) Current screen view, (3) What you double-click and why, (4) What will open or activate. Write 5-7 sentences."
+                    # }
+                # },
+                # "required": ["x", "y", "story"]
+            # }
+        # }
+    # },
+    # {
+        # "type": "function",
+        # "function": {
+            # "name": "drag",
+            # "description": "Drag from start to end position (move windows, including your memory window)",
+            # "parameters": {
+                # "type": "object",
+                # "properties": {
+                    # "x1": {"type": "number", "description": "Start X (0-1000)"},
+                    # "y1": {"type": "number", "description": "Start Y (0-1000)"},
+                    # "x2": {"type": "number", "description": "End X (0-1000)"},
+                    # "y2": {"type": "number", "description": "End Y (0-1000)"},
+                    # "story": {
+                        # "type": "string",
+                        # "description": "Write your story. Include: (1) Your memory, (2) What you see on screen, (3) What you are dragging from where to where, (4) Why you move it (is it blocking something?), (5) Where it should go. Write 6-8 sentences."
+                    # }
+                # },
+                # "required": ["x1", "y1", "x2", "y2", "story"]
+            # }
+        # }
+    # },
+    # {
+        # "type": "function",
+        # "function": {
+            # "name": "type",
+            # "description": "Type text",
+            # "parameters": {
+                # "type": "object",
+                # "properties": {
+                    # "text": {"type": "string", "description": "Text to type"},
+                    # "story": {
+                        # "type": "string",
+                        # "description": "Write your story. Include: (1) Your memory, (2) What you see, (3) Where you are typing (what window or field), (4) What text you type and why, (5) What you expect after typing. Write 6-8 sentences."
+                    # }
+                # },
+                # "required": ["text", "story"]
+            # }
+        # }
+    # },
+    # {
+        # "type": "function",
+        # "function": {
+            # "name": "scroll",
+            # "description": "Scroll vertically",
+            # "parameters": {
+                # "type": "object",
+                # "properties": {
+                    # "dy": {"type": "number", "description": "Scroll amount (positive=up, negative=down)"},
+                    # "story": {
+                        # "type": "string",
+                        # "description": "Write your story. Include: (1) Your memory, (2) Current screen, (3) What window you scroll, (4) Direction and reason (what do you want to see?), (5) What you expect to find. Write 5-7 sentences."
+                    # }
+                # },
+                # "required": ["dy", "story"]
+            # }
+        # }
+    # }
+# ]
+
+
+INITIAL_STORY = """I awaken. I see my memory window - the cyan box with title 'FRANZ MEMORY'. This box is my mind.
+
+I look around the screen. Top left: desktop icons. Top right: system tray. Center: windows and text. Bottom: taskbar. Time visible: checking now.
+
+My memory window is here in front of me. If it blocks something important, I will drag it to a better position. I can move it anywhere.
+
+I will explore this digital world. I will observe, think, and act. Every moment I look, remember, and choose. The story continues with each action."""
+
+
+# INITIAL_STORY = """I awaken. The cyan window titled FRANZ MEMORY is my mind. I see the desktop screen around me.
+
+# Looking around: top-left has icons, top-right shows system tray, center has windows, bottom shows taskbar.
+
+# My memory window floats here. I can drag it if it blocks something. I will explore, observe, and act. Time passes. I watch and respond. The story begins."""
+
+
+user32 = ctypes.WinDLL("user32", use_last_error=True)
+gdi32 = ctypes.WinDLL("gdi32", use_last_error=True)
+kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+try:
+    ctypes.WinDLL("Shcore").SetProcessDpiAwareness(2)
+except:
+    pass
+
+try:
+    kernel32.LoadLibraryW("Msftedit.dll")
+except:
+    pass
+
+INPUT_MOUSE = 0
+INPUT_KEYBOARD = 1
+WHEEL_DELTA = 120
+
+MOUSEEVENTF_MOVE = 0x0001
+MOUSEEVENTF_ABSOLUTE = 0x8000
+MOUSEEVENTF_LEFTDOWN = 0x0002
+MOUSEEVENTF_LEFTUP = 0x0004
+MOUSEEVENTF_RIGHTDOWN = 0x0008
+MOUSEEVENTF_RIGHTUP = 0x0010
+MOUSEEVENTF_WHEEL = 0x0800
+
+KEYEVENTF_UNICODE = 0x0004
+KEYEVENTF_KEYUP = 0x0002
+
+# Modified window styles for draggable window with title bar
+WS_OVERLAPPED = 0x00000000
+WS_CAPTION = 0x00C00000
+WS_SYSMENU = 0x00080000
+WS_THICKFRAME = 0x00040000
+WS_MINIMIZEBOX = 0x00020000
+WS_VISIBLE = 0x10000000
+WS_VSCROLL = 0x00200000
+ES_MULTILINE = 0x0004
+ES_AUTOVSCROLL = 0x0040
+ES_READONLY = 0x0800
+WS_EX_TOPMOST = 0x00000008
+
+WM_SETFONT = 0x0030
+WM_DESTROY = 0x0002
+WM_CTLCOLOREDIT = 0x0133
+EM_SETBKGNDCOLOR = 0x0443
+SW_SHOWNOACTIVATE = 4
+SWP_NOMOVE = 0x0002
+SWP_NOSIZE = 0x0001
+SWP_NOACTIVATE = 0x0010
+SWP_SHOWWINDOW = 0x0040
+HWND_TOPMOST = -1
+SRCOPY = 0x00CC0020
+
+class MOUSEINPUT(ctypes.Structure):
+    _fields_ = [
+        ("dx", w.LONG),
+        ("dy", w.LONG),
+        ("mouseData", w.DWORD),
+        ("dwFlags", w.DWORD),
+        ("time", w.DWORD),
+        ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong))
+    ]
+
+class KEYBDINPUT(ctypes.Structure):
+    _fields_ = [
+        ("wVk", w.WORD),
+        ("wScan", w.WORD),
+        ("dwFlags", w.DWORD),
+        ("time", w.DWORD),
+        ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong))
+    ]
+
+class HARDWAREINPUT(ctypes.Structure):
+    _fields_ = [
+        ("uMsg", w.DWORD),
+        ("wParamL", w.WORD),
+        ("wParamH", w.WORD)
+    ]
+
+class _INPUTunion(ctypes.Union):
+    _fields_ = [
+        ("mi", MOUSEINPUT),
+        ("ki", KEYBDINPUT),
+        ("hi", HARDWAREINPUT)
+    ]
+
+class INPUT(ctypes.Structure):
+    _fields_ = [
+        ("type", w.DWORD),
+        ("union", _INPUTunion)
+    ]
+
+class BITMAPINFOHEADER(ctypes.Structure):
+    _fields_ = [
+        ("biSize", w.DWORD),
+        ("biWidth", w.LONG),
+        ("biHeight", w.LONG),
+        ("biPlanes", w.WORD),
+        ("biBitCount", w.WORD),
+        ("biCompression", w.DWORD),
+        ("biSizeImage", w.DWORD),
+        ("biXPelsPerMeter", w.LONG),
+        ("biYPelsPerMeter", w.LONG),
+        ("biClrUsed", w.DWORD),
+        ("biClrImportant", w.DWORD)
+    ]
+
+class BITMAPINFO(ctypes.Structure):
+    _fields_ = [
+        ("bmiHeader", BITMAPINFOHEADER),
+        ("bmiColors", w.DWORD * 3)
+    ]
+
+class MSG(ctypes.Structure):
+    _fields_ = [
+        ("hwnd", w.HWND),
+        ("message", ctypes.c_uint),
+        ("wParam", w.WPARAM),
+        ("lParam", w.LPARAM),
+        ("time", w.DWORD),
+        ("pt", w.POINT)
+    ]
+
+user32.CreateWindowExW.argtypes = [
+    w.DWORD, w.LPCWSTR, w.LPCWSTR, w.DWORD,
+    ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+    w.HWND, w.HMENU, w.HINSTANCE, w.LPVOID
+]
+user32.CreateWindowExW.restype = w.HWND
+user32.ShowWindow.argtypes = [w.HWND, ctypes.c_int]
+user32.ShowWindow.restype = w.BOOL
+user32.SetWindowPos.argtypes = [w.HWND, w.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+user32.SetWindowPos.restype = w.BOOL
+user32.DestroyWindow.argtypes = [w.HWND]
+user32.DestroyWindow.restype = w.BOOL
+user32.SendInput.argtypes = [ctypes.c_uint, ctypes.POINTER(INPUT), ctypes.c_int]
+user32.SendInput.restype = ctypes.c_uint
+user32.GetSystemMetrics.argtypes = [ctypes.c_int]
+user32.GetSystemMetrics.restype = ctypes.c_int
+user32.GetDC.argtypes = [w.HWND]
+user32.GetDC.restype = w.HDC
+user32.ReleaseDC.argtypes = [w.HWND, w.HDC]
+user32.ReleaseDC.restype = ctypes.c_int
+user32.SetWindowTextW.argtypes = [w.HWND, w.LPCWSTR]
+user32.SetWindowTextW.restype = w.BOOL
+user32.SendMessageW.argtypes = [w.HWND, ctypes.c_uint, w.WPARAM, w.LPARAM]
+user32.SendMessageW.restype = w.LPARAM
+user32.PostMessageW.argtypes = [w.HWND, ctypes.c_uint, w.WPARAM, w.LPARAM]
+user32.PostMessageW.restype = w.BOOL
+user32.GetMessageW.argtypes = [ctypes.POINTER(MSG), w.HWND, ctypes.c_uint, ctypes.c_uint]
+user32.GetMessageW.restype = w.BOOL
+user32.TranslateMessage.argtypes = [ctypes.POINTER(MSG)]
+user32.TranslateMessage.restype = w.BOOL
+user32.DispatchMessageW.argtypes = [ctypes.POINTER(MSG)]
+user32.DispatchMessageW.restype = w.LPARAM
+gdi32.CreateCompatibleDC.argtypes = [w.HDC]
+gdi32.CreateCompatibleDC.restype = w.HDC
+gdi32.CreateDIBSection.argtypes = [
+    w.HDC, ctypes.POINTER(BITMAPINFO), ctypes.c_uint,
+    ctypes.POINTER(ctypes.c_void_p), w.HANDLE, w.DWORD
+]
+gdi32.CreateDIBSection.restype = w.HBITMAP
+gdi32.SelectObject.argtypes = [w.HDC, w.HGDIOBJ]
+gdi32.SelectObject.restype = w.HGDIOBJ
+gdi32.BitBlt.argtypes = [w.HDC, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, w.HDC, ctypes.c_int, ctypes.c_int, w.DWORD]
+gdi32.BitBlt.restype = w.BOOL
+gdi32.DeleteObject.argtypes = [w.HGDIOBJ]
+gdi32.DeleteObject.restype = w.BOOL
+gdi32.DeleteDC.argtypes = [w.HDC]
+gdi32.DeleteDC.restype = w.BOOL
+gdi32.CreateFontW.argtypes = [
+    ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+    w.DWORD, w.DWORD, w.DWORD, w.DWORD, w.DWORD, w.DWORD, w.DWORD, w.DWORD, w.LPCWSTR
+]
+gdi32.CreateFontW.restype = w.HFONT
+gdi32.CreateSolidBrush.argtypes = [w.COLORREF]
+gdi32.CreateSolidBrush.restype = w.HBRUSH
+kernel32.GetModuleHandleW.argtypes = [w.LPCWSTR]
+kernel32.GetModuleHandleW.restype = w.HMODULE
+
+@dataclass(slots=True)
+class Coord:
+    sw: int
+    sh: int
+    
+    def to_screen(self, x: float, y: float) -> tuple[int, int]:
+        return (
+            int(max(0.0, min(1000.0, x)) * self.sw / 1000),
+            int(max(0.0, min(1000.0, y)) * self.sh / 1000)
+        )
+    
+    def to_win32(self, x: int, y: int) -> tuple[int, int]:
+        return (
+            int(x * 65535 / self.sw) if self.sw > 0 else 0,
+            int(y * 65535 / self.sh) if self.sh > 0 else 0
+        )
+
+def send_input(inputs: list[INPUT]) -> None:
+    arr = (INPUT * len(inputs))(*inputs)
+    sent = user32.SendInput(len(inputs), arr, ctypes.sizeof(INPUT))
+    if sent != len(inputs):
+        raise ctypes.WinError(ctypes.get_last_error())
+    time.sleep(0.05)
+
+def make_mouse_input(dx: int, dy: int, flags: int, data: int = 0) -> INPUT:
+    inp = INPUT()
+    inp.type = INPUT_MOUSE
+    inp.union.mi = MOUSEINPUT(dx=dx, dy=dy, mouseData=data, dwFlags=flags, time=0, dwExtraInfo=None)
+    return inp
+
+def mouse_click(x: int, y: int, conv: Coord) -> None:
+    ax, ay = conv.to_win32(x, y)
+    send_input([
+        make_mouse_input(ax, ay, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE),
+        make_mouse_input(0, 0, MOUSEEVENTF_LEFTDOWN),
+        make_mouse_input(0, 0, MOUSEEVENTF_LEFTUP)
+    ])
+
+def mouse_right_click(x: int, y: int, conv: Coord) -> None:
+    ax, ay = conv.to_win32(x, y)
+    send_input([
+        make_mouse_input(ax, ay, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE),
+        make_mouse_input(0, 0, MOUSEEVENTF_RIGHTDOWN),
+        make_mouse_input(0, 0, MOUSEEVENTF_RIGHTUP)
+    ])
+
+def mouse_double_click(x: int, y: int, conv: Coord) -> None:
+    ax, ay = conv.to_win32(x, y)
+    click_down = make_mouse_input(0, 0, MOUSEEVENTF_LEFTDOWN)
+    click_up = make_mouse_input(0, 0, MOUSEEVENTF_LEFTUP)
+    send_input([
+        make_mouse_input(ax, ay, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE),
+        click_down, click_up
+    ])
+    time.sleep(0.05)
+    send_input([click_down, click_up])
+
+def mouse_drag(x1: int, y1: int, x2: int, y2: int, conv: Coord) -> None:
+    ax1, ay1 = conv.to_win32(x1, y1)
+    ax2, ay2 = conv.to_win32(x2, y2)
+    
+    send_input([
+        make_mouse_input(ax1, ay1, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE),
+        make_mouse_input(0, 0, MOUSEEVENTF_LEFTDOWN)
+    ])
+    time.sleep(0.05)
+    
+    steps = 10
+    for i in range(1, steps + 1):
+        t = i / steps
+        ix = int(ax1 + (ax2 - ax1) * t)
+        iy = int(ay1 + (ay2 - ay1) * t)
+        send_input([make_mouse_input(ix, iy, MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE)])
+        time.sleep(0.01)
+    
+    send_input([make_mouse_input(0, 0, MOUSEEVENTF_LEFTUP)])
+
+def type_text(text: str) -> None:
+    if not text:
+        return
+    
+    inputs: list[INPUT] = []
+    utf16_bytes = text.encode("utf-16le")
+    
+    for i in range(0, len(utf16_bytes), 2):
+        code = utf16_bytes[i] | (utf16_bytes[i + 1] << 8)
+        
+        inp_down = INPUT()
+        inp_down.type = INPUT_KEYBOARD
+        inp_down.union.ki = KEYBDINPUT(wVk=0, wScan=code, dwFlags=KEYEVENTF_UNICODE, time=0, dwExtraInfo=None)
+        inputs.append(inp_down)
+        
+        inp_up = INPUT()
+        inp_up.type = INPUT_KEYBOARD
+        inp_up.union.ki = KEYBDINPUT(wVk=0, wScan=code, dwFlags=KEYEVENTF_UNICODE | KEYEVENTF_KEYUP, time=0, dwExtraInfo=None)
+        inputs.append(inp_up)
+    
+    if inputs:
+        send_input(inputs)
+
+def scroll(dy: float) -> None:
+    ticks = max(1, int(abs(dy) / WHEEL_DELTA))
+    direction = 1 if dy > 0 else -1
+    send_input([make_mouse_input(0, 0, MOUSEEVENTF_WHEEL, WHEEL_DELTA * direction) for _ in range(ticks)])
+
+def capture_screen(sw: int, sh: int) -> bytes:
+    sdc = user32.GetDC(0)
+    if not sdc:
+        raise ctypes.WinError(ctypes.get_last_error())
+    
+    mdc = gdi32.CreateCompatibleDC(sdc)
+    if not mdc:
+        user32.ReleaseDC(0, sdc)
+        raise ctypes.WinError(ctypes.get_last_error())
+    
+    bmi = BITMAPINFO()
+    bmi.bmiHeader.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+    bmi.bmiHeader.biWidth = sw
+    bmi.bmiHeader.biHeight = -sh
+    bmi.bmiHeader.biPlanes = 1
+    bmi.bmiHeader.biBitCount = 32
+    
+    bits = ctypes.c_void_p()
+    hbm = gdi32.CreateDIBSection(sdc, ctypes.byref(bmi), 0, ctypes.byref(bits), None, 0)
+    if not hbm:
+        gdi32.DeleteDC(mdc)
+        user32.ReleaseDC(0, sdc)
+        raise ctypes.WinError(ctypes.get_last_error())
+    
+    gdi32.SelectObject(mdc, hbm)
+    
+    if not gdi32.BitBlt(mdc, 0, 0, sw, sh, sdc, 0, 0, SRCOPY):
+        gdi32.DeleteObject(hbm)
+        gdi32.DeleteDC(mdc)
+        user32.ReleaseDC(0, sdc)
+        raise ctypes.WinError(ctypes.get_last_error())
+    
+    out = ctypes.string_at(bits, sw * sh * 4)
+    
+    user32.ReleaseDC(0, sdc)
+    gdi32.DeleteDC(mdc)
+    gdi32.DeleteObject(hbm)
+    
+    return out
+
+def downsample(src: bytes, sw: int, sh: int, dw: int, dh: int) -> bytes:
+    if (sw, sh) == (dw, dh):
+        return src
+    
+    dst = bytearray(dw * dh * 4)
+    src_mv = memoryview(src)
+    
+    x_scale = sw / dw
+    y_scale = sh / dh
+    
+    for dy in range(dh):
+        y_start = int(dy * y_scale)
+        y_end = min(int((dy + 1) * y_scale), sh)
+        
+        for dx in range(dw):
+            x_start = int(dx * x_scale)
+            x_end = min(int((dx + 1) * x_scale), sw)
+            
+            accum = [0, 0, 0, 0]
+            count = 0
+            
+            for sy in range(y_start, y_end):
+                for sx in range(x_start, x_end):
+                    si = (sy * sw + sx) * 4
+                    for c in range(4):
+                        accum[c] += src_mv[si + c]
+                    count += 1
+            
+            di = (dy * dw + dx) * 4
+            if count > 0:
+                for c in range(4):
+                    dst[di + c] = accum[c] // count
+    
+    return bytes(dst)
+
+def encode_png(bgra: bytes, width: int, height: int) -> bytes:
+    raw = bytearray((width * 3 + 1) * height)
+    
+    for y in range(height):
+        raw[y * (width * 3 + 1)] = 0
+        row_offset = y * width * 4
+        row = bgra[row_offset:row_offset + width * 4]
+        di = y * (width * 3 + 1) + 1
+        
+        for x in range(width):
+            raw[di + x * 3] = row[x * 4 + 2]
+            raw[di + x * 3 + 1] = row[x * 4 + 1]
+            raw[di + x * 3 + 2] = row[x * 4]
+    
+    comp = zlib.compress(bytes(raw), 6)
+    ihdr = struct.pack(">2I5B", width, height, 8, 2, 0, 0, 0)
+    
+    chunk = lambda tag, data: struct.pack(">I", len(data)) + tag + data + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+    
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", comp) + chunk(b"IEND", b"")
+
+def call_vlm(png: bytes) -> tuple[str, dict[str, Any]]:
+    payload = {
+        "model": MODEL_NAME,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": [{
+                "type": "image_url",
+                "image_url": {"url": f"data:image/png;base64,{base64.b64encode(png).decode('ascii')}"}
+            }]}
+        ],
+        "tools": TOOLS,
+        "tool_choice": "required",
+        **SAMPLING_CONFIG
+    }
+    
+    req = urllib.request.Request(
+        API_URL,
+        json.dumps(payload).encode("utf-8"),
+        {"Content-Type": "application/json"}
+    )
+    
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        data: dict[str, Any] = json.load(resp)
+    
+    message = data["choices"][0]["message"]
+    tool_calls = message["tool_calls"]
+    tc = tool_calls[0]
+    
+    name: str = tc["function"]["name"]
+    args_raw = tc["function"]["arguments"]
+    args: dict[str, Any] = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
+    
+    return name, args
+
+@dataclass(slots=True)
+class HUD:
+    hwnd: w.HWND | None = None
+    thread: threading.Thread | None = None
+    ready_event: threading.Event = field(default_factory=threading.Event)
+    stop_event: threading.Event = field(default_factory=threading.Event)
+    
+    def _window_thread(self) -> None:
+        hinst = kernel32.GetModuleHandleW(None)
+        
+        sw = user32.GetSystemMetrics(0)
+        sh = user32.GetSystemMetrics(1)
+        
+        win_w, win_h = (sw // 4, sh // 4) if HUD_SIZE == 0 else (480, 600)
+        win_x, win_y = (500, 500) if HUD_SIZE == 0 else (1400, 200)
+        
+        # CHANGE 1: Modified window style to include title bar and make it draggable
+        # Added WS_CAPTION for title bar, WS_SYSMENU for system menu, WS_THICKFRAME for resizable border
+        self.hwnd = user32.CreateWindowExW(
+            WS_EX_TOPMOST,
+            "EDIT",
+            "🔷 FRANZ MEMORY 🔷",  # CHANGE 2: Distinctive title with cyan diamond markers
+            WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_VISIBLE | WS_VSCROLL | ES_MULTILINE | ES_AUTOVSCROLL | ES_READONLY,
+            win_x, win_y, win_w, win_h,
+            None, None, hinst, None
+        )
+        
+        if not self.hwnd:
+            self.ready_event.set()
+            return
+        
+        font = gdi32.CreateFontW(-16, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 0, 0, "Consolas")
+        if font:
+            user32.SendMessageW(self.hwnd, WM_SETFONT, font, 1)
+        
+        # CHANGE 3: Cyan-tinted background for visual distinctiveness (dark cyan: 0x3E3E1E)
+        user32.SendMessageW(self.hwnd, EM_SETBKGNDCOLOR, 0, 0x3E3E1E)
+        user32.SetWindowTextW(self.hwnd, INITIAL_STORY)
+        
+        user32.ShowWindow(self.hwnd, SW_SHOWNOACTIVATE)
+        user32.SetWindowPos(
+            self.hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW
+        )
+        
+        self.ready_event.set()
+        
+        msg = MSG()
+        while not self.stop_event.is_set():
+            ret = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
+            if ret == 0 or ret == -1:
+                break
+            user32.TranslateMessage(ctypes.byref(msg))
+            user32.DispatchMessageW(ctypes.byref(msg))
+    
+    def __enter__(self) -> HUD:
+        self.ready_event.clear()
+        self.stop_event.clear()
+        self.thread = threading.Thread(target=self._window_thread, daemon=True)
+        self.thread.start()
+        self.ready_event.wait(timeout=2.0)
+        time.sleep(0.2)
+        return self
+    
+    def __exit__(self, *_: Any) -> None:
+        if self.hwnd:
+            user32.PostMessageW(self.hwnd, WM_DESTROY, 0, 0)
+        self.stop_event.set()
+        if self.thread:
+            self.thread.join(timeout=1.0)
+    
+    def update(self, story: str) -> None:
+        if self.hwnd:
+            user32.SetWindowTextW(self.hwnd, story)
+            user32.SetWindowPos(
+                self.hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW
+            )
+
+def generate_test_story(tool: str) -> str:
+    stories = {
+        "click": "Testing click tool execution. Mouse pointer moves to target coordinates. A single left-click event is simulated at the specified position.",
+        "right_click": "Testing right-click tool execution. Context menu should appear at target location. Right mouse button press and release simulated successfully.",
+        "double_click": "Testing double-click tool execution. Rapid two-click sequence initiated at coordinates. File or text selection should activate upon completion.",
+        "drag": "Testing drag tool execution. Mouse button held down at start position. Smooth movement interpolated to end coordinates with release.",
+        "type": "Testing type tool execution. Unicode text input simulated character by character. Keyboard events generated for each character in sequence.",
+        "scroll": "Testing scroll tool execution. Mouse wheel events generated with specified direction. Vertical scrolling simulated through Windows input system."
+    }
+    return stories.get(tool, "Unknown tool test initiated. Execution parameters validated. Result pending observation.")
+
+def execute_tool_action(tool: str, args: dict[str, Any], conv: Coord) -> None:
+    if tool == "click":
+        sx, sy = conv.to_screen(float(args["x"]), float(args["y"]))
+        mouse_click(sx, sy, conv)
+    elif tool == "right_click":
+        sx, sy = conv.to_screen(float(args["x"]), float(args["y"]))
+        mouse_right_click(sx, sy, conv)
+    elif tool == "double_click":
+        sx, sy = conv.to_screen(float(args["x"]), float(args["y"]))
+        mouse_double_click(sx, sy, conv)
+    elif tool == "drag":
+        sx1, sy1 = conv.to_screen(float(args["x1"]), float(args["y1"]))
+        sx2, sy2 = conv.to_screen(float(args["x2"]), float(args["y2"]))
+        mouse_drag(sx1, sy1, sx2, sy2, conv)
+    elif tool == "type":
+        type_text(str(args["text"]))
+    elif tool == "scroll":
+        scroll(float(args["dy"]))
+
+def test_tool(tool: str, **kwargs) -> None:
+    sw = user32.GetSystemMetrics(0)
+    sh = user32.GetSystemMetrics(1)
+    conv = Coord(sw=sw, sh=sh)
+    
+    print(f"Testing tool: {tool}")
+    print(f"Parameters: {kwargs}")
+    
+    args = {**kwargs, "story": generate_test_story(tool)}
+    
+    with HUD() as hud:
+        story = args["story"]
+        hud.update(story)
+        print(f"\nStory: {story}\n")
+        time.sleep(1.0)
+        
+        execute_tool_action(tool, args, conv)
+        
+        time.sleep(2.0)
+        print(f"Tool {tool} executed successfully")
+
+def prompt_with_default(prompt: str, default: Any) -> str:
+    response = input(f"{prompt} [{default}]: ").strip()
+    return response if response else str(default)
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="FRANZ - Stateless Narrative-Driven Desktop Agent")
+    parser.add_argument("--test", choices=["click", "right_click", "double_click", "drag", "type", "scroll"], help="Test a specific tool")
+    
+    args = parser.parse_args()
+    
+    if args.test:
+        params = {}
+        if args.test in ["click", "right_click", "double_click"]:
+            params = {
+                "x": float(prompt_with_default("X coordinate (0-1000)", 500)),
+                "y": float(prompt_with_default("Y coordinate (0-1000)", 500))
+            }
+        elif args.test == "drag":
+            params = {
+                "x1": float(prompt_with_default("Start X (0-1000)", 400)),
+                "y1": float(prompt_with_default("Start Y (0-1000)", 400)),
+                "x2": float(prompt_with_default("End X (0-1000)", 600)),
+                "y2": float(prompt_with_default("End Y (0-1000)", 600))
+            }
+        elif args.test == "type":
+            params = {
+                "text": prompt_with_default("Text to type", "Hello FRANZ")
+            }
+        elif args.test == "scroll":
+            params = {
+                "dy": float(prompt_with_default("Scroll amount (positive=up, negative=down)", 240))
+            }
+        
+        test_tool(args.test, **params)
+        return
+    
+    sw = user32.GetSystemMetrics(0)
+    sh = user32.GetSystemMetrics(1)
+    conv = Coord(sw=sw, sh=sh)
+    
+    dump_dir = DUMP_FOLDER / f"run_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    dump_dir.mkdir(parents=True, exist_ok=True)
+    
+    print(f"FRANZ awakens | Physical: {sw}x{sh} | Perception: {SCREEN_W}x{SCREEN_H}")
+    print(f"Quality: {SCREENSHOT_QUALITY} | Sampling: temp={SAMPLING_CONFIG['temperature']} top_p={SAMPLING_CONFIG['top_p']}")
+    print(f"Dump: {dump_dir}\n")
+    
+    with HUD() as hud:
+        step = 0
+        current_story = INITIAL_STORY
+        
+        time.sleep(0.5)
+        
+        while True:
+            step += 1
+            ts = datetime.now().strftime("%H:%M:%S")
+            
+            bgra = capture_screen(sw, sh)
+            down = downsample(bgra, sw, sh, SCREEN_W, SCREEN_H)
+            png = encode_png(down, SCREEN_W, SCREEN_H)
+            (dump_dir / f"step{step:03d}.png").write_bytes(png)
+            
+            try:
+                tool, args = call_vlm(png)
+                story = args.get("story", current_story)
+                
+                print(f"\n[{ts}] {step:03d} | {tool}")
+                print(f"{story}\n")
+                
+                current_story = story
+                hud.update(story)
+                
+                time.sleep(0.2)
+                
+                if tool != "observe":
+                    execute_tool_action(tool, args, conv)
+                    time.sleep(0.5)
+                else:
+                    time.sleep(1.0)
+            
+            except Exception as e:
+                print(f"[{ts}] Error: {e}")
+                time.sleep(2.0)
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\nFRANZ sleeps.")
