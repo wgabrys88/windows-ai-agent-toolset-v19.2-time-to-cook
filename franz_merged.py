@@ -300,6 +300,10 @@ COLOR_WINDOW = 5
 
 PM_REMOVE = 0x0001
 
+# Helper for MAKEINTRESOURCEW (LoadCursor/LoadIcon with integer IDs)
+def MAKEINTRESOURCEW(i: int) -> w.LPCWSTR:
+    return ctypes.cast(ctypes.c_void_p(i & 0xFFFF), w.LPCWSTR)
+
 # Common controls
 class INITCOMMONCONTROLSEX(ctypes.Structure):
     _fields_ = [("dwSize", w.DWORD), ("dwICC", w.DWORD)]
@@ -935,7 +939,7 @@ class HUD:
         wc.cbWndExtra = 0
         wc.hInstance = hinst
         wc.hIcon = None
-        wc.hCursor = user32.LoadCursorW(None, IDC_ARROW)
+        wc.hCursor = user32.LoadCursorW(None, MAKEINTRESOURCEW(IDC_ARROW))
         # Proper brush handle: COLOR_* constants require +1 when casted.
         wc.hbrBackground = w.HBRUSH(COLOR_WINDOW + 1)
         wc.lpszMenuName = None
