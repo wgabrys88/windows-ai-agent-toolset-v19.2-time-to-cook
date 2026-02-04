@@ -37,20 +37,20 @@ API_URL = "http://localhost:1234/v1/chat/completions"
 MODEL_NAME = "qwen3-vl-2b-instruct"
 
 # Keep the stable defaults from working-code.py unless you intentionally retune.
-SCREENSHOT_QUALITY = 1
+SCREENSHOT_QUALITY = 3
 SCREEN_W, SCREEN_H = {1: (1536, 864), 2: (1024, 576), 3: (512, 288)}[SCREENSHOT_QUALITY]
 
 DUMP_FOLDER = Path("dump")
 HUD_SIZE = 1
 
 SAMPLING_CONFIG = {
-    "temperature": 3.2,
+    "temperature": 1.2,
     "top_p": 0.95,
     "top_k": 40,
     "presence_penalty": 0.0,
     "frequency_penalty": 0.0,
     "repeat_penalty": 1.05,
-    "max_tokens": 1200,
+    "max_tokens": 400,
 }
 
 # Use the "memory window" mental model introduced in not-working-code-new-features.py.
@@ -465,7 +465,7 @@ user32.GetWindowTextLengthW.restype = ctypes.c_int
 user32.GetWindowTextW.argtypes = [w.HWND, w.LPWSTR, ctypes.c_int]
 user32.GetWindowTextW.restype = ctypes.c_int
 
-user32.SetLayeredWindowAttributes.argtypes = [w.HWND, w.COLORREF, ctypes.c_byte, w.DWORD]
+user32.SetLayeredWindowAttributes.argtypes = [w.HWND, w.COLORREF, ctypes.c_ubyte, w.DWORD]
 user32.SetLayeredWindowAttributes.restype = w.BOOL
 
 user32.DefWindowProcW.argtypes = [w.HWND, ctypes.c_uint, w.WPARAM, w.LPARAM]
@@ -888,7 +888,7 @@ class HUD:
                     pos = int(user32.SendMessageW(self.slider_hwnd, TBM_GETPOS, 0, 0))
                     # Clamp to a sane alpha range.
                     pos = max(20, min(255, pos))
-                    user32.SetLayeredWindowAttributes(self.hwnd, 0, ctypes.c_byte(pos), LWA_ALPHA)
+                    user32.SetLayeredWindowAttributes(self.hwnd, 0, ctypes.c_ubyte(pos), LWA_ALPHA)
                     return 0
 
             elif msg == WM_SIZE:
@@ -975,10 +975,10 @@ class HUD:
             return
 
         # Fully opaque by default.
-        user32.SetLayeredWindowAttributes(self.hwnd, 0, ctypes.c_byte(255), LWA_ALPHA)
+        user32.SetLayeredWindowAttributes(self.hwnd, 0, ctypes.c_ubyte(255), LWA_ALPHA)
 
         # Fonts
-        mono_font = gdi32.CreateFontW(-16, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 0, 0, "Consolas")
+        mono_font = gdi32.CreateFontW(-48, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 0, 0, "Consolas")
         ui_font = gdi32.CreateFontW(-14, 0, 0, 0, 700, 0, 0, 0, 1, 0, 0, 0, 0, "Segoe UI")
 
         # RichEdit child for reliable EM_SETBKGNDCOLOR.
@@ -1039,7 +1039,7 @@ class HUD:
         )
 
         if self.slider_hwnd:
-            user32.SendMessageW(self.slider_hwnd, TBM_SETRANGE, 1, (20 << 16) | 255)
+            user32.SendMessageW(self.slider_hwnd, TBM_SETRANGE, 1, (255 << 16) | 20)
             user32.SendMessageW(self.slider_hwnd, TBM_SETPOS, 1, 255)
 
         # Start paused (editable).
