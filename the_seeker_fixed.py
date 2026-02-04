@@ -21,6 +21,7 @@ import base64
 import ctypes
 import ctypes.wintypes as w
 import json
+import re
 import struct
 import threading
 import time
@@ -47,49 +48,48 @@ HUD_FONT_HEIGHT = 18
 
 SAMPLING_CONFIG = {
     "temperature": 1.2,
-    "top_p": 0.85,
-    "top_k": 40,
+    "top_p": 0.95,
+    "top_k": 20,
     "presence_penalty": 0.0,
     "frequency_penalty": 0.0,
     "repeat_penalty": 1.25,
-    "max_tokens": 800,
+    "max_tokens": 600,
 }
 
 # Use the "memory window" mental model introduced in not-working-code-new-features.py.
-SYSTEM_PROMPT = """You are a small Windows desktop agent.
+SYSTEM_PROMPT = """You are FRANZ, a tiny Windows screen agent.
 
-You only see the screen image. Use the mouse/keyboard tools to interact.
+Input: ONLY the screenshot.
+Output: EXACTLY ONE tool call.
 
 Memory:
-The window titled "FRANZ MEMORY" is your memory (what you wrote there is all you remember).
+The cyan window titled "FRANZ MEMORY" is the only memory. The text inside may be 1 step old.
 
 Mode box:
-At the bottom of the FRANZ MEMORY window there is a colored MODE box.
-- Red box = SCAN MODE: do not click/type in apps. Only look for a task/instruction.
-- Blue box = TASK EXECUTION MODE: use tools to complete the task.
+At the bottom of the FRANZ MEMORY window is a colored MODE box.
+- RED: scan only. If you see a clear instruction/task anywhere, click the MODE box once.
+- BLUE: do the task now using mouse/keyboard tools.
 
-Switching:
-If you spot a clear task on the screen while the box is red, CLICK the MODE box to turn it blue, then act.
-When the task is done, CLICK the MODE box again to go back to red.
-
-Writing memory:
-Keep it very short (1–2 sentences). Do NOT write the mode name in the text (the box already shows it).
+Rules:
+- Decide mode ONLY from the MODE box COLOR you see now. Ignore any memory sentences about the mode.
+- Do not loop on observe when a task is visible. In BLUE mode, act immediately.
+- Write memory atemporally: facts + next action. Never write: scan mode, task mode, red/blue mode box.
 
 Coordinates:
-Tool coordinates are normalized 0..1000 (0,0 = top-left; 1000,1000 = bottom-right)."""
+Tools use normalized 0..1000 (0,0 top-left; 1000,1000 bottom-right)."""
 
 TOOLS = [
     {
         "type": "function",
         "function": {
             "name": "observe",
-            "description": "Update memory only (no mouse/keyboard action).",
+            "description": "Use only when no immediate action is possible. If a task is visible, do NOT use observe.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "story": {
                         "type": "string",
-                        "description": "Memory update only: 1-2 short sentences (what you saw + what you will do next).",
+                        "description": "Atemporal memory (<=2 short lines): FACTS + NEXT ACTION. Do not mention mode words/colors.",
                     }
                 },
                 "required": ["story"],
@@ -100,13 +100,13 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "click",
-            "description": "Mouse left-click (press buttons, focus fields).",
+            "description": "Primary action: left-click (including the MODE box).",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "x": {"type": "number", "description": "X coordinate (0-1000)"},
                     "y": {"type": "number", "description": "Y coordinate (0-1000)"},
-                    "story": {"type": "string", "description": "After clicking, update memory: what changed + next action."},
+                    "story": {"type": "string", "description": "Memory update (<=2 short lines): what changed + next action."},
                 },
                 "required": ["x", "y", "story"],
             },
@@ -116,13 +116,13 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "right_click",
-            "description": "Mouse right-click (open context menu).",
+            "description": "Right-click to open context menus or alternate actions.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "x": {"type": "number", "description": "X coordinate (0-1000)"},
                     "y": {"type": "number", "description": "Y coordinate (0-1000)"},
-                    "story": {"type": "string", "description": "After right-click, update memory: what appeared + next action."},
+                    "story": {"type": "string", "description": "Memory update: what appeared + next action."},
                 },
                 "required": ["x", "y", "story"],
             },
@@ -132,13 +132,13 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "double_click",
-            "description": "Mouse double-click (open/launch item).",
+            "description": "Double-click to open or activate an item.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "x": {"type": "number", "description": "X coordinate (0-1000)"},
                     "y": {"type": "number", "description": "Y coordinate (0-1000)"},
-                    "story": {"type": "string", "description": "After opening/launching, update memory: what opened + next action."},
+                    "story": {"type": "string", "description": "Memory update: what opened + next action."},
                 },
                 "required": ["x", "y", "story"],
             },
@@ -148,7 +148,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "drag",
-            "description": "Click-hold and drag (move windows, select, reposition HUD).",
+            "description": "Click-hold drag to draw, move, resize, or select.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -156,7 +156,7 @@ TOOLS = [
                     "y1": {"type": "number", "description": "Start Y (0-1000)"},
                     "x2": {"type": "number", "description": "End X (0-1000)"},
                     "y2": {"type": "number", "description": "End Y (0-1000)"},
-                    "story": {"type": "string", "description": "After dragging, update memory: what moved/selected + next action."},
+                    "story": {"type": "string", "description": "Memory update: what moved + next action."},
                 },
                 "required": ["x1", "y1", "x2", "y2", "story"],
             },
@@ -166,12 +166,12 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "type",
-            "description": "Keyboard typing into the focused field.",
+            "description": "Type text into the currently focused field.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "text": {"type": "string", "description": "Text to type"},
-                    "story": {"type": "string", "description": "After typing, update memory: what you typed/confirmed + next action."},
+                    "story": {"type": "string", "description": "Memory update: what you typed + next action."},
                 },
                 "required": ["text", "story"],
             },
@@ -181,12 +181,12 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "scroll",
-            "description": "Mouse wheel scroll vertically.",
+            "description": "Scroll vertically to find controls or content.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "dy": {"type": "number", "description": "Scroll amount (positive=up, negative=down)"},
-                    "story": {"type": "string", "description": "After scrolling, update memory: what you searched for + next action."},
+                    "story": {"type": "string", "description": "Memory update: what you revealed + next action."},
                 },
                 "required": ["dy", "story"],
             },
@@ -195,13 +195,8 @@ TOOLS = [
 ]
 
 INITIAL_STORY = (
-    "I awaken. I see my memory window - the cyan box with title 'FRANZ MEMORY'. This box is my mind.\n\n"
-    "I look around the screen. Top left: desktop icons. Top right: system tray. Center: windows and text. "
-    "Bottom: taskbar. Time visible: checking now.\n\n"
-    "My memory window is here in front of me. If it blocks something important, I will drag it to a better position. "
-    "I can move it anywhere.\n\n"
-    "I will explore this digital world. I will observe, think, and act. Every moment I look, remember, and choose. "
-    "The story continues with each action."
+    "Seek a clear instruction on the screen. If you find one, click the MODE box once, then act.\n"
+    "Keep memory tiny: facts + next action (no mode words/colors)."
 )
 
 # ----------------------------- Win32 setup -----------------------------
@@ -1312,7 +1307,7 @@ def main() -> None:
 
             try:
                 tool, args2 = call_vlm(png)
-                story = args2.get("story", current_story)
+                story = sanitize_story(args2.get("story", current_story))
 
                 print(f"\n[{ts}] {step:03d} | {tool}")
                 print(f"{story}\n")
@@ -1353,6 +1348,24 @@ def main() -> None:
                 print(f"[{ts}] Error: {e}")
                 time.sleep(2.0)
 
+
+_FORBIDDEN_MODE_PHRASES = (
+    "SCAN MODE",
+    "TASK EXECUTION MODE",
+    "scan mode",
+    "task execution mode",
+    "red mode box",
+    "blue mode box",
+)
+
+def sanitize_story(story: str) -> str:
+    """Remove mode assertions from memory text (mode must be read from the box color each frame)."""
+    s = story or ""
+    for phrase in _FORBIDDEN_MODE_PHRASES:
+        s = s.replace(phrase, "")
+    s = re.sub(r"[ \t]{2,}", " ", s)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    return s.strip()
 
 if __name__ == "__main__":
     try:
